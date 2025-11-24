@@ -1,0 +1,551 @@
+var GLPi = {
+    params: {},
+
+    setParams: function (params) {
+        if (typeof params !== 'object') {
+            return;
+        }
+        GLPi.params = params;
+    },
+
+    setProxy: function (HTTPProxy) {
+        GLPi.HTTPProxy = HTTPProxy;
+    },
+
+    urlCheckFormat: function (url) {
+        // Add https:// if no protocol specified
+        if (url.indexOf('http://') === -1 && url.indexOf('https://') === -1) {
+            url = 'https://' + url;
+        }
+
+        // For GLPi URLs, ensure they end with / but don't have /apirest.php/ already
+        if (typeof url === 'string') {
+            // Remove any existing /apirest.php/ suffix
+            url = url.replace(/\/apirest\.php\/+$/, '');
+            
+            // Ensure URL ends with /
+            if (!url.endsWith('/')) {
+                url += '/';
+            }
+        }
+
+        return url;
+    },
+
+    validateGLPiConnection: function (url, app_token) {
+        // Remove the connectivity test as it requires session token
+        // We'll rely on the authentication step to validate connectivity
+        Zabbix.log(4, '[ GLPi Webhook ] Skipping connectivity test, will validate during authentication');
+        return true;
+    },
+
+    getAuthToken: function (url, token, app_token) {
+        var response,
+            request = new HttpRequest();
+
+        request.addHeader('Content-Type: application/json');
+        request.addHeader('App-Token: ' + app_token);
+        request.addHeader('Authorization: user_token ' + token);
+
+        Zabbix.log(4, '[ GLPi Webhook ] Auth URL: ' + url + "apirest.php/initSession");
+        Zabbix.log(4, '[ GLPi Webhook ] App-Token: ' + app_token);
+        Zabbix.log(4, '[ GLPi Webhook ] User-Token: ' + token);
+
+        try {
+            response = request.get(url + "apirest.php/initSession");
+        }
+        catch (error) {
+            Zabbix.log(4, '[ GLPi Webhook ] HTTP request failed: ' + error);
+            throw 'Failed to connect to GLPi API. Check URL and network connectivity.';
+        }
+
+        var httpStatus = request.getStatus();
+        Zabbix.log(4, '[ GLPi Webhook ] Auth response status: ' + httpStatus);
+        Zabbix.log(4, '[ GLPi Webhook ] Auth response: ' + response);
+
+        // Check HTTP status first
+        if (httpStatus < 200 || httpStatus >= 300) {
+            throw 'Authentication failed with HTTP status ' + httpStatus + '. Check GLPi URL, App-Token, and User-Token.';
+        }
+
+        // Check for empty response
+        if (response === null || response === '') {
+            throw 'Empty authentication response from GLPi. Check if GLPi API is enabled and accessible.';
+        }
+
+        // Parse JSON response
+        var parsedResponse;
+        try {
+            parsedResponse = JSON.parse(response);
+        }
+        catch (error) {
+            Zabbix.log(4, '[ GLPi Webhook ] Failed to parse auth response: ' + error);
+            Zabbix.log(4, '[ GLPi Webhook ] Raw auth response: ' + response);
+            throw 'Invalid JSON response from GLPi authentication endpoint.';
+        }
+
+        // Handle array response (error format)
+        if (Array.isArray(parsedResponse)) {
+            Zabbix.log(4, '[ GLPi Webhook ] Auth response is array: ' + JSON.stringify(parsedResponse));
+            if (parsedResponse.length > 1 && parsedResponse[1]) {
+                throw 'GLPi authentication error: ' + parsedResponse[1];
+            } else {
+                throw 'GLPi authentication failed with unknown array response.';
+            }
+        }
+
+        // Validate session token
+        if (typeof parsedResponse !== 'object' || parsedResponse === null || !parsedResponse.session_token) {
+            Zabbix.log(4, '[ GLPi Webhook ] Invalid auth response structure: ' + JSON.stringify(parsedResponse));
+            throw 'GLPi authentication response missing session_token. Check user permissions.';
+        }
+
+        Zabbix.log(4, '[ GLPi Webhook ] Authentication successful, session token obtained');
+        return parsedResponse.session_token;
+    },
+
+    getProblemUrl: function (zabbix_url, triggerid, eventid, event_source) {
+        var problem_url = zabbix_url;
+
+        if (event_source === '0') {
+            problem_url += 'tr_events.php?triggerid=' + triggerid + '&eventid=' + eventid;
+        } else {
+            // For non-trigger events, use generic event URL
+            problem_url += 'zabbix.php?action=problem.view&filter_set=1&eventids[]=' + eventid;
+        }
+
+        return problem_url;
+    },
+
+    // Helper function to map Zabbix severity to GLPi urgency
+    mapSeverityToUrgency: function (severity) {
+        // Default mapping - adjust based on your needs
+        var severityMap = {
+            '0': 1, // Not classified -> Very low
+            '1': 1, // Information -> Very low  
+            '2': 2, // Warning -> Low
+            '3': 3, // Average -> Medium
+            '4': 4, // High -> High
+            '5': 5  // Disaster -> Very high
+        };
+        
+        return severityMap[severity] || 3; // Default to Medium if unknown
+    },
+
+    // Function to build proper message content based on event type
+    buildMessageContent: function (params) {
+        var message = '';
+        
+        // Use individual parameters instead of alert_message if available
+        if (params.event_name && params.host_name) {
+            if (params.event_source === '0' && params.event_value === '0') {
+                // Recovery message
+                message = 'Problem has been resolved';
+                if (params.event_duration) {
+                    message += ' in ' + params.event_duration;
+                }
+                if (params.event_recovery_time && params.event_recovery_date) {
+                    message += ' at ' + params.event_recovery_time + ' on ' + params.event_recovery_date;
+                }
+                message += '\nProblem name: ' + params.event_name;
+                message += '\nHost: ' + params.host_name;
+                if (params.event_severity) {
+                    message += '\nSeverity: ' + params.event_severity;
+                }
+                message += '\nOriginal problem ID: ' + params.event_id;
+            } else if (params.event_source === '0' && params.event_update_status === '1') {
+                // Update message
+                message = '';
+                if (params.user_fullname && params.event_update_action) {
+                    message += params.user_fullname + ' ' + params.event_update_action + ' problem';
+                }
+                if (params.event_update_date && params.event_update_time) {
+                    message += ' at ' + params.event_update_date + ' ' + params.event_update_time;
+                }
+                if (params.event_update_message) {
+                    message += '.\n' + params.event_update_message;
+                }
+                message += '\n\nCurrent problem status is ' + (params.event_status || 'unknown');
+                message += ', acknowledged: ' + (params.event_ack_status || 'unknown') + '.';
+            } else {
+                // Problem creation message
+                message = 'Problem started';
+                if (params.event_time && params.event_date) {
+                    message += ' at ' + params.event_time + ' on ' + params.event_date;
+                }
+                message += '\nProblem name: ' + params.event_name;
+                message += '\nHost: ' + params.host_name;
+                if (params.event_severity) {
+                    message += '\nSeverity: ' + params.event_severity;
+                }
+                if (params.event_opdata) {
+                    message += '\nOperational data: ' + params.event_opdata;
+                }
+                message += '\nOriginal problem ID: ' + params.event_id;
+            }
+            
+            // Add trigger URL if available
+            if (params.trigger_url && params.trigger_url !== '' && !params.trigger_url.includes('{')) {
+                message += '\n' + params.trigger_url;
+            }
+        } else {
+            // Fallback to alert_message if individual parameters not available
+            message = params.alert_message || 'Zabbix event detected.\nEvent ID: ' + params.event_id + 
+                     '\nEvent Source: ' + params.event_source + 
+                     '\nEvent Value: ' + params.event_value;
+        }
+        
+        return message;
+    },
+
+    // Function to build proper subject based on event type
+    buildSubject: function (params) {
+        var subject = '';
+        // Para abertura de problema, usar "host_name | event_name"
+        if (params.event_name && params.host_name && (!params.event_status || params.event_status === 'PROBLEM')) {
+            subject = params.host_name + ' | ' + params.event_name;
+        } else if (params.event_name && params.event_status) {
+            subject = '[' + params.event_status + '] ' + params.event_name;
+        } else if (params.event_name) {
+            subject = params.event_name;
+        } else {
+            // Fallback to alert_subject or default
+            subject = params.alert_subject || 'Zabbix Alert - Event ID: ' + params.event_id;
+        }
+        return subject;
+    },
+
+    request: function (method, url, data) {
+        if (typeof GLPi.params !== 'object' || typeof GLPi.params.authToken === 'undefined' || GLPi.params.authToken === '') {
+            throw 'Required GLPi param authToken is not set.';
+        }
+
+        var response,
+            request = new HttpRequest();
+
+        request.addHeader('Content-Type: application/json');
+        request.addHeader('App-Token: ' + GLPi.params.app_token);
+        request.addHeader('Session-Token: ' + GLPi.params.authToken);
+
+        if (typeof GLPi.HTTPProxy !== 'undefined' && GLPi.HTTPProxy !== '') {
+            request.setProxy(GLPi.HTTPProxy);
+        }
+
+        if (typeof data !== 'undefined') {
+            data = JSON.stringify(data);
+        }
+
+        Zabbix.log(4, '[ GLPi Webhook ] Sending request: ' + url + ((typeof data === 'string')
+            ? ('\n' + data)
+            : ''));
+
+        switch (method) {
+            case 'post':
+                response = request.post(url, data);
+                break;
+
+            case 'put':
+                response = request.put(url, data);
+                break;
+
+            default:
+                throw 'Unsupported HTTP request method: ' + method;
+        }
+
+        Zabbix.log(4, '[ GLPi Webhook ] Received response with status code ' +
+            request.getStatus() + '\n' + response);
+
+        // Check HTTP status first before trying to parse JSON
+        if (request.getStatus() < 200 || request.getStatus() >= 300) {
+            var message = 'Request failed with status code ' + request.getStatus();
+            
+            Zabbix.log(4, '[ GLPi Webhook ] HTTP Status: ' + request.getStatus());
+            Zabbix.log(4, '[ GLPi Webhook ] Raw error response: ' + response);
+
+            // Try to parse error response for additional info
+            if (response !== null) {
+                try {
+                    var errorResponse = JSON.parse(response);
+                    if (errorResponse && errorResponse.message) {
+                        message += ': ' + errorResponse.message;
+                    } else if (errorResponse && Array.isArray(errorResponse) && errorResponse[1]) {
+                        message += ': ' + errorResponse[1];
+                    }
+                }
+                catch (parseError) {
+                    // If we can't parse the error response, include it as raw text
+                    message += ': ' + response;
+                }
+            }
+
+            throw message + ' Check debug log for more information.';
+        }
+
+        // Handle null or empty response
+        if (response === null || response === '') {
+            Zabbix.log(4, '[ GLPi Webhook ] Empty response received from URL: ' + url);
+            Zabbix.log(4, '[ GLPi Webhook ] Request method: ' + method);
+            Zabbix.log(4, '[ GLPi Webhook ] Request data: ' + (data || 'none'));
+            
+            // Empty response from GLPi API might indicate an error
+            // For POST requests creating tickets, we should expect a response with ID
+            if (method === 'post' && url.indexOf('/Problem/') !== -1) {
+                throw 'GLPi API returned empty response for ticket creation. This usually indicates a validation error or missing required fields. Check GLPi logs for details.';
+            }
+            
+            // For other operations, empty response might be normal
+            Zabbix.log(4, '[ GLPi Webhook ] HTTP status successful but empty response - treating as success for non-creation operations');
+            return { success: true, message: 'Operation completed successfully (empty response)' };
+        }
+
+        // Try to parse JSON response
+        var parsedResponse;
+        try {
+            parsedResponse = JSON.parse(response);
+        }
+        catch (error) {
+            Zabbix.log(4, '[ GLPi Webhook ] Failed to parse response received from GLPi: ' + error);
+            Zabbix.log(4, '[ GLPi Webhook ] Raw response: ' + response);
+            throw 'Failed to parse JSON response received from GLPi. Raw response: ' + response.substring(0, 200) + '...';
+        }
+
+        // Validate parsed response
+        if (typeof parsedResponse === 'undefined') {
+            Zabbix.log(4, '[ GLPi Webhook ] Undefined response after parsing');
+            throw 'Undefined response received from GLPi after JSON parsing.';
+        }
+
+        // Handle array responses (which can indicate errors in GLPi)
+        if (Array.isArray(parsedResponse)) {
+            Zabbix.log(4, '[ GLPi Webhook ] Array response received: ' + JSON.stringify(parsedResponse));
+            if (parsedResponse.length > 1 && parsedResponse[1]) {
+                throw 'Error from GLPi API: ' + parsedResponse[1];
+            }
+            // If it's an array but no error message, return the response
+            return parsedResponse;
+        }
+
+        // For successful responses, the response should be an object
+        if (typeof parsedResponse !== 'object' || parsedResponse === null) {
+            Zabbix.log(4, '[ GLPi Webhook ] Invalid response type: ' + typeof parsedResponse);
+            Zabbix.log(4, '[ GLPi Webhook ] Response value: ' + JSON.stringify(parsedResponse));
+            throw 'Invalid response type received from GLPi. Expected object, got: ' + typeof parsedResponse;
+        }
+
+        return parsedResponse;
+    }
+};
+
+try {
+    var params = JSON.parse(value),
+        glpi = {},
+        url = '',
+        data = {},
+        comment_data,
+        result = { tags: {} },
+        required_params = [
+            'event_source', 'event_value',
+            'event_update_status', 'event_recovery_value',
+            'event_id', 'trigger_id', 'zabbix_url',
+            'glpi_token', 'glpi_url', 'glpi_app_token'
+        ],
+        method = 'post',
+        process_tags = true,
+        response;
+
+    Object.keys(params)
+        .forEach(function (key) {
+            if (key.startsWith('glpi_')) {
+                glpi[key.substring(5)] = params[key];
+            }
+            else if (required_params.indexOf(key) !== -1 && params[key] === '') {
+                throw 'Parameter "' + key + '" can\'t be empty.';
+            }
+        });
+
+    // Corrigir: tentar obter o problem_id também das tags do evento, se não vier como parâmetro
+    if (!glpi.problem_id && params.event_tags) {
+        try {
+            var tags = JSON.parse(params.event_tags);
+            if (Array.isArray(tags)) {
+                tags.forEach(function(tag) {
+                    if (tag.tag === '__zbx_glpi_problem_id') {
+                        glpi.problem_id = tag.value;
+                    }
+                });
+            }
+        } catch (e) {
+            Zabbix.log(4, '[ GLPi Webhook ] Falha ao processar event_tags: ' + e);
+        }
+    }
+
+    if ([0, 1, 2, 3].indexOf(parseInt(params.event_source)) === -1) {
+        throw 'Incorrect "event_source" parameter given: ' + params.event_source + '\nMust be 0-3.';
+    }
+
+    // Check {EVENT.VALUE} for trigger-based and internal events.
+    if (params.event_value !== '0' && params.event_value !== '1'
+        && (params.event_source === '0' || params.event_source === '3')) {
+        throw 'Incorrect "event_value" parameter given: ' + params.event_value + '\nMust be 0 or 1.';
+    }
+
+    // Check {EVENT.UPDATE.STATUS} only for trigger-based events.
+    if (params.event_update_status !== '0' && params.event_update_status !== '1' && params.event_source === '0') {
+        throw 'Incorrect "event_update_status" parameter given: ' + params.event_update_status + '\nMust be 0 or 1.';
+    }
+
+    if (params.event_source !== '0' && params.event_recovery_value === '0') {
+        throw 'Recovery operations are supported only for trigger-based actions.';
+    }
+
+    if (typeof params.zabbix_url !== 'string' || params.zabbix_url.trim() === '' || params.zabbix_url === '{$ZABBIX.URL}') {
+        throw 'Field "zabbix_url" cannot be empty.';
+    }
+
+    // Check for backslash in the end of url and schema.
+    glpi.url = GLPi.urlCheckFormat(glpi.url);
+    params.zabbix_url = GLPi.urlCheckFormat(params.zabbix_url);
+
+    Zabbix.log(4, '[ GLPi Webhook ] Processed GLPi URL: ' + glpi.url);
+    Zabbix.log(4, '[ GLPi Webhook ] Processed Zabbix URL: ' + params.zabbix_url);
+
+    // Test GLPi API connectivity first
+    Zabbix.log(4, '[ GLPi Webhook ] Testing GLPi API connectivity...');
+    GLPi.validateGLPiConnection(glpi.url, glpi.app_token);
+
+    // Get authentication token
+    Zabbix.log(4, '[ GLPi Webhook ] Getting authentication token...');
+    glpi.authToken = GLPi.getAuthToken(glpi.url, glpi.token, glpi.app_token);
+    GLPi.setParams(glpi);
+
+    // Build proper subject and message using individual parameters
+    var alert_subject = GLPi.buildSubject(params);
+    var alert_message = GLPi.buildMessageContent(params);
+    var event_nseverity = params.event_nseverity || '3';
+    
+    // Handle unresolved macros
+    if (event_nseverity.includes('{') && event_nseverity.includes('}')) {
+        Zabbix.log(4, '[ GLPi Webhook ] Warning: Event severity contains unresolved macros, using default');
+        event_nseverity = '3'; // Default to Average
+    }
+
+    // Debug: Log processed values
+    Zabbix.log(4, '[ GLPi Webhook ] Processed alert subject: ' + alert_subject);
+    Zabbix.log(4, '[ GLPi Webhook ] Processed alert message: ' + alert_message);
+    Zabbix.log(4, '[ GLPi Webhook ] Processed event severity: ' + event_nseverity);
+
+    // Map severity to urgency
+    var urgency = GLPi.mapSeverityToUrgency(event_nseverity);
+    
+    data = {
+        'input': {
+            'name': alert_subject,
+            'content': alert_message + '\n\nZabbix Link: ' + GLPi.getProblemUrl(params.zabbix_url, params.trigger_id, params.event_id, params.event_source),
+            'status': 1,  // New
+            'urgency': urgency,
+            'type': 1,    // Incident
+            'category': 0 // No category
+        }
+    };
+
+    Zabbix.log(4, '[ GLPi Webhook ] Event source: ' + params.event_source);
+    Zabbix.log(4, '[ GLPi Webhook ] Event value: ' + params.event_value);
+    Zabbix.log(4, '[ GLPi Webhook ] Update status: ' + params.event_update_status);
+
+    // In case of resolve
+    if (params.event_source === '0' && params.event_value === '0') {
+        process_tags = false;
+        
+        if (!glpi.problem_id) {
+            throw 'Problem ID is required for resolution but not provided. Cannot resolve ticket.';
+        }
+        
+        var dataFollowup = {
+            'input': {
+                'items_id': glpi.problem_id,
+                'itemtype': 'Problem',
+                'content': alert_message + '\n\nZabbix Link: ' + GLPi.getProblemUrl(params.zabbix_url, params.trigger_id, params.event_id, params.event_source)
+            }
+        };
+        
+        var dataProblem = {
+            'input': {
+                'status': 5,  // Solved
+                'solution': alert_message
+            }
+        };
+
+        GLPi.request('put', glpi.url + 'apirest.php/Problem/' + glpi.problem_id, dataProblem);
+        GLPi.request('post', glpi.url + 'apirest.php/Problem/' + glpi.problem_id + '/ITILFollowup', dataFollowup);
+        
+        Zabbix.log(4, '[ GLPi Webhook ] Problem resolved successfully');
+    }
+
+    // In case of update
+    else if (params.event_source === '0' && params.event_update_status === '1') {
+        process_tags = false;
+        
+        if (!glpi.problem_id) {
+            throw 'Problem ID is required for update but not provided. Cannot update ticket.';
+        }
+        
+        var dataFollowup = {
+            'input': {
+                'items_id': glpi.problem_id,
+                'itemtype': 'Problem',
+                'content': alert_message + '\n\nZabbix Link: ' + GLPi.getProblemUrl(params.zabbix_url, params.trigger_id, params.event_id, params.event_source)
+            }
+        };
+        
+        var dataProblem = {
+            'input': {
+                'name': alert_subject,
+                'urgency': urgency
+            }
+        };
+
+        GLPi.request('put', glpi.url + 'apirest.php/Problem/' + glpi.problem_id, dataProblem);
+        GLPi.request('post', glpi.url + 'apirest.php/Problem/' + glpi.problem_id + '/ITILFollowup', dataFollowup);
+        
+        Zabbix.log(4, '[ GLPi Webhook ] Problem updated successfully');
+    }
+
+    // In case of problem creation
+    else {
+        Zabbix.log(4, '[ GLPi Webhook ] Creating new problem with data: ' + JSON.stringify(data));
+        response = GLPi.request('post', glpi.url + 'apirest.php/Problem/', data);
+        
+        Zabbix.log(4, '[ GLPi Webhook ] Problem creation response: ' + JSON.stringify(response));
+        
+        // Handle different response formats
+        if (typeof response === 'object' && response !== null) {
+            if (response.id) {
+                // Standard GLPi response format
+                Zabbix.log(4, '[ GLPi Webhook ] Problem created with ID: ' + response.id);
+            } else if (Array.isArray(response) && response.length > 0 && response[0] && response[0].id) {
+                // Sometimes GLPi returns an array with the created object
+                response = response[0];
+                Zabbix.log(4, '[ GLPi Webhook ] Problem created with ID (from array): ' + response.id);
+            } else {
+                Zabbix.log(4, '[ GLPi Webhook ] Warning: Response does not contain expected ID field');
+                Zabbix.log(4, '[ GLPi Webhook ] Full response: ' + JSON.stringify(response));
+                throw 'GLPi ticket creation failed - no ID returned. Check GLPi logs and required field validation.';
+            }
+        } else {
+            Zabbix.log(4, '[ GLPi Webhook ] Unexpected response type: ' + typeof response);
+            throw 'GLPi API returned unexpected response format. Check GLPi API status and logs.';
+        }
+    }
+
+    if (process_tags && response && response.id) {
+        result.tags.__zbx_glpi_problem_id = response.id;
+        result.tags.__zbx_glpi_link = glpi.url + 'front/problem.form.php?id=' + response.id;
+    }
+
+    Zabbix.log(4, '[ GLPi Webhook ] Result: ' + JSON.stringify(result));
+    return JSON.stringify(result);
+}
+catch (error) {
+    Zabbix.log(4, '[ GLPi Webhook ] ERROR: ' + error);
+    throw 'Sending failed: ' + error;
+}
